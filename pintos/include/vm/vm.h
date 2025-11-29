@@ -42,17 +42,19 @@ struct thread;
  * DO NOT REMOVE/MODIFY PREDEFINED MEMBER OF THIS STRUCTURE. */
 struct page {
 	const struct page_operations *operations;
-	void *va;              /* Address in terms of user space */
-	struct frame *frame;   /* Back reference for frame */
+	void *va;              // 가상 주소
+	struct frame *frame;   // RAM에 있으면 어떤 프레임과 연결되어 있는가
 
 	/* Your implementation */
+	bool writable;	// 페이지 쓰기 읽기 권한
+	struct hash_elem *e; // SPT(해시 테이블)에 대한 연결고리
 
 	/* Per-type data are binded into the union.
 	 * Each function automatically detects the current union */
 	union {
-		struct uninit_page uninit;
-		struct anon_page anon;
-		struct file_page file;
+		struct uninit_page uninit; // 아직 로딩 안된 상태 -> 로딩 대기중
+		struct anon_page anon; // 스택/힙 or 스왑 에 없는 상태
+		struct file_page file; // 파일에 매핑된 상태
 #ifdef EFILESYS
 		struct page_cache page_cache;
 #endif
@@ -85,6 +87,7 @@ struct page_operations {
  * We don't want to force you to obey any specific design for this struct.
  * All designs up to you for this. */
 struct supplemental_page_table {
+	struct hash pages;
 };
 
 #include "threads/thread.h"
