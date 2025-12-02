@@ -42,7 +42,7 @@ struct thread;
  * DO NOT REMOVE/MODIFY PREDEFINED MEMBER OF THIS STRUCTURE. */
 struct page {
 	const struct page_operations *operations;
-	void *va;              // 가상 주소
+	void *va;            // 가상 주소
 	struct frame *frame;   // RAM에 있으면 어떤 프레임과 연결되어 있는가
 
 	/* Your implementation */
@@ -87,7 +87,7 @@ struct page_operations {
  * We don't want to force you to obey any specific design for this struct.
  * All designs up to you for this. */
 struct supplemental_page_table {
-	struct hash pages;
+	struct hash page;
 };
 
 #include "threads/thread.h"
