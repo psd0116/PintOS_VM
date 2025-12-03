@@ -21,6 +21,7 @@
 #include "intrinsic.h"
 #include "devices/timer.h"
 #include "filesys/file.h"
+#define VM 1
 #ifdef VM
 #include "vm/vm.h"
 #endif
@@ -305,6 +306,9 @@ process_exec (void *f_name) {
 	// 먼저 현재 컨텍스트를 종료 -> pml4 파괴술
 	process_cleanup();
 
+	#ifdef VM
+		supplemental_page_table_init (&thread_current()->spt);
+	#endif
 	/* And then load the binary */
 	// 바이너리를 로드
 	success = load (file_name, &_if);
@@ -382,31 +386,35 @@ process_exit (void) {
 	// 강제종료될 경우 정상적으로 닫히지 않은 잔존 파일들 닫아주기
 	if (curr->fdt_table != NULL){
 		// 이미 닫힌 파일들을 추적하기 위한 배열
-		bool closed_files[512];
-		memset(closed_files, false, sizeof(closed_files));
-		
 		for (int i = 2; i < 512; i++){
-			if (curr->fdt_table[i] != NULL && !closed_files[i]){
-				struct file *file = curr->fdt_table[i];
-				
-				// stdout marker 처리
-				if (file == (struct file *)1) {
-					closed_files[i] = true;
-					curr->fdt_table[i] = NULL;
-					continue;
-				}
-				
-				// 같은 파일을 가리키는 모든 fd를 닫힘으로 표시
-				for (int j = i; j < 512; j++){
-					if (curr->fdt_table[j] == file){
-						closed_files[j] = true;
+			if (curr->fdt_table != NULL) {
+				for (int i = 2; i < 512; i++) {
+					struct file *file = curr->fdt_table[i];
+					
+					// 1. 이미 비어있으면 패스
+					if (file == NULL) continue;
+
+					curr->fdt_table[i] = NULL; // 현재 칸 비우기
+
+					// 2. stdout marker인 경우 (닫을 필요 없음)
+					if (file == (struct file *)1) {
+						continue; 
+					}
+
+					// 3. 파일 닫기 (진짜 메모리 해제)
+					file_close(file);
+
+					// 4. [핵심] 나랑 같은 파일을 가리키는 다른 fd들도 미리 NULL로 밀어버림
+					// (dup2로 복사된 fd들을 처리하기 위함)
+					for (int j = i + 1; j < 512; j++) {
+						if (curr->fdt_table[j] == file) {
+							curr->fdt_table[j] = NULL; // 미리 지워둠 -> 나중에 루프가 여기 도달하면 continue됨
+						}
 					}
 				}
-				// 파일을 한 번만 닫기
-				file_close(file);
-				curr->fdt_table[i] = NULL;
-			} else if (curr->fdt_table[i] != NULL){
-				curr->fdt_table[i] = NULL;
+				// 테이블 자체 해제
+				palloc_free_page(curr->fdt_table);
+				curr->fdt_table = NULL;
 			}
 		}
 		palloc_free_page(curr->fdt_table);
@@ -440,7 +448,7 @@ process_cleanup (void) {
 	struct thread *curr = thread_current ();
 	
 	#ifdef VM
-	supplemental_page_table_kill (&curr->spt);
+		supplemental_page_table_kill (&curr->spt);
 	#endif
 
 	uint64_t *pml4;
@@ -453,7 +461,7 @@ process_cleanup (void) {
 		 * so that a timer interrupt can't switch back to the
 		 * process page directory.  We must activate the base page
 		 * directory before destroying the process's page
-		 * directory, or our active page directory will be one1
+		 * directory, or our active page directory will be one
 		 * that's been freed (and cleared). */
 		curr->pml4 = NULL;
 		pml4_activate (NULL);
@@ -562,7 +570,7 @@ load (const char *file_name, struct intr_frame *if_) {
 	goto done;
 	process_activate (thread_current ());
 
-	file_name_copy = palloc_get_page(0);
+	file_name_copy = palloc_get_page(PAL_ZERO);
 
 	if (file_name_copy == NULL)
 	{
@@ -655,8 +663,9 @@ load (const char *file_name, struct intr_frame *if_) {
 
 	
 	/* Set up stack. */
-	if (!setup_stack (if_))
-	goto done;
+	if (!setup_stack (if_)){
+		goto done;
+	}
 	
 	/* Start address. */
 	if_->rip = ehdr.e_entry;
@@ -890,11 +899,32 @@ install_page (void *upage, void *kpage, bool writable) {
  * If you want to implement the function for only project 2, implement it on the
  * upper block. */
 
+struct aux_info {
+	struct file *file;
+	off_t ofs;
+	uint32_t read_bytes;
+	uint32_t zero_bytes;
+};
+
 static bool
 lazy_load_segment (struct page *page, void *aux) {
 	/* TODO: Load the segment from the file */
 	/* TODO: This called when the first page fault occurs on address VA. */
 	/* TODO: VA is available when calling this function. */
+	struct aux_info *new = (struct aux_info *)aux;
+	
+	lock_acquire(&filesys_lock);
+	file_seek(new->file, new->ofs);
+	if(file_read(new->file, page->frame->kva, new->read_bytes) != (int) new->read_bytes){
+        return false; 
+    }
+	lock_release(&filesys_lock);
+
+	memset(page->frame->kva + new->read_bytes, 0, new->zero_bytes);
+
+	free(aux);
+
+	return true;
 }
 
 /* Loads a segment starting at offset OFS in FILE at address
@@ -926,12 +956,25 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
 		size_t page_zero_bytes = PGSIZE - page_read_bytes;
 
 		/* TODO: Set up aux to pass information to the lazy_load_segment. */
-		void *aux = NULL;
-		if (!vm_alloc_page_with_initializer (VM_ANON, upage,
-					writable, lazy_load_segment, aux))
-			return false;
+		struct aux_info *aux = malloc(sizeof(struct aux_info));
+		if (aux == NULL) return false;
 
+		aux->file = file_reopen(file);
+		aux->ofs = ofs;
+		aux->read_bytes = page_read_bytes;
+		aux->zero_bytes = page_zero_bytes;
+
+		if (aux->file == NULL) {
+			free(aux);
+			return false;
+		}
+		/* Get a page of memory. */
+		if (!vm_alloc_page_with_initializer (VM_FILE, upage, writable, lazy_load_segment, aux)){
+			free(aux);
+			return false;
+		}
 		/* Advance. */
+		ofs += page_read_bytes;
 		read_bytes -= page_read_bytes;
 		zero_bytes -= page_zero_bytes;
 		upage += PGSIZE;
@@ -948,8 +991,27 @@ setup_stack (struct intr_frame *if_) {
 	/* TODO: Map the stack on stack_bottom and claim the page immediately.
 	 * TODO: If success, set the rsp accordingly.
 	 * TODO: You should mark the page is stack. */
-	/* TODO: Your code goes here */
+	if (vm_alloc_page (VM_ANON | VM_MARKER_0, stack_bottom, true)) {
+		success = vm_claim_page (stack_bottom);
+		if (success)
+			if_->rsp = USER_STACK;
+	}
 
 	return success;
 }
+// static bool setup_stack(struct intr_frame* if_) {
+//     struct page* page;
+//     struct thread* cur = thread_current();
+//     void* stack_bottom = (uint8_t*)USER_STACK - PGSIZE;
+//     if (!vm_alloc_page_with_initializer(VM_ANON | VM_MARKER_0, stack_bottom, true, NULL, NULL))
+//         return false;
+//     if (!vm_claim_page(stack_bottom)) {
+//         page = spt_find_page(&cur->spt, stack_bottom);
+//         if (page != NULL)
+//             spt_remove_page(&cur->spt, page);
+//         return false;
+//     }
+//     if_->rsp = USER_STACK;
+//     return true;
+// }
 #endif /* VM */
