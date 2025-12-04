@@ -62,6 +62,8 @@ syscall_init (void) {
 /* The main system call interface */
 void
 syscall_handler (struct intr_frame *f UNUSED) {
+	// 유저 스택 포인터 백업
+	thread_current()->stack_pointer = f->rsp;
 	// TODO: Your implementation goes here.
 	int syscall_num = f->R.rax;
 	// f->R.rax : 시스템 콜 번호 (반환 값은 처리가 끝난 후 여기에 저장됨)
