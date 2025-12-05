@@ -939,8 +939,9 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
 			free(aux);
 			return false;
 		}
+
 		// 페이지 예약하기
-		if (!vm_alloc_page_with_initializer (VM_FILE, upage, writable, lazy_load_segment, aux)){
+		if (!vm_alloc_page_with_initializer (VM_ANON, upage, writable, lazy_load_segment, aux)){
 			free(aux);
 			return false;
 		}

@@ -200,13 +200,14 @@ vm_try_handle_fault (struct intr_frame *f UNUSED, void *addr UNUSED,
 	
 	// 스탯 포인터 확인
 	uintptr_t rsp;
-	if(user){
-		// 유저 모드 폴트 -> intr_frame에 저장된 rsp가 진짜임
-		rsp = f->rsp;
-	} else {
-		// 커널 모드 폴트 -> intr_frame의 rsp는 쓰레기 값이므로, 백업해둔 값 사용
-		rsp = thread_current()->stack_pointer;
-	}
+	// if(user){
+	// 	// 유저 모드 폴트 -> intr_frame에 저장된 rsp가 진짜임
+	// 	rsp = f->rsp;
+	// } else {
+	// 	// 커널 모드 폴트 -> intr_frame의 rsp는 쓰레기 값이므로, 백업해둔 값 사용
+	// 	rsp = thread_current()->stack_pointer;
+	// }
+	rsp = f->rsp;
 
 	// 스택 확장 판별 / 접근 주소가 USER_STACK인가? / 접근 주소가 1MB 제한 이내인가? /
 	if (addr <= (void *)USER_STACK && addr >= (void *)(USER_STACK - (1 << 20)) && addr >= (void *)(rsp - 8)){
@@ -215,7 +216,7 @@ vm_try_handle_fault (struct intr_frame *f UNUSED, void *addr UNUSED,
 		}
 	}
 	
-	if (!not_present)
+	if (!not_present && write)
 		return false;
 
 	// 페이지 복구 및 물리 메모리 연결
@@ -300,76 +301,89 @@ supplemental_page_table_init (struct supplemental_page_table *spt UNUSED) {
 	hash_init (&spt->page, page_hash, page_less, NULL);
 }
 
+// 헬퍼 함수 1: UNINIT 페이지 복사
+static bool
+copy_uninit_page(struct supplemental_page_table *dst, 
+                 struct page *src_page, void *upage, bool writable) {
+    vm_initializer *init = src_page->uninit.init;
+    void *aux = src_page->uninit.aux;
+
+    if (src_page->uninit.type & VM_FILE) {
+        // FILE-BACKED UNINIT
+        struct aux_info *src_aux = (struct aux_info *) aux;
+        struct aux_info *dst_aux = malloc(sizeof(struct aux_info));
+        if (dst_aux == NULL) return false;
+
+        dst_aux->file = file_reopen(src_aux->file);
+        if (dst_aux->file == NULL) {
+            free(dst_aux);
+            return false;
+        }
+        dst_aux->ofs = src_aux->ofs;
+        dst_aux->read_bytes = src_aux->read_bytes;
+        dst_aux->zero_bytes = src_aux->zero_bytes;
+
+        if (!vm_alloc_page_with_initializer(src_page->uninit.type, upage, writable, init, dst_aux)) {
+            file_close(dst_aux->file);
+            free(dst_aux);
+            return false;
+        }
+    } else {
+        // ANON UNINIT
+        if (!vm_alloc_page_with_initializer(VM_ANON, upage, writable, NULL, NULL)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// 헬퍼 함수 2: PRESENT 페이지 복사
+static bool
+copy_present_page(struct supplemental_page_table *dst,
+                  struct page *src_page, void *upage, bool writable) {
+    // 자식에게는 VM_ANON으로 할당
+    if (!vm_alloc_page_with_initializer(VM_ANON, upage, writable, NULL, NULL)) {
+        return false;
+    }
+    if (!vm_claim_page(upage)) {
+        return false;
+    }
+
+    struct page *dst_page = spt_find_page(dst, upage);
+    
+    if (src_page->frame == NULL) {
+        return false;
+    }
+
+    if (dst_page->frame != NULL) {
+        memcpy(dst_page->frame->kva, src_page->frame->kva, PGSIZE);
+    } else {
+        return false;
+    }
+
+    return true;
+}
+
 /* Copy supplemental page table from src to dst */
 bool
-supplemental_page_table_copy (struct supplemental_page_table *dst UNUSED,
-                              struct supplemental_page_table *src UNUSED) {
+supplemental_page_table_copy(struct supplemental_page_table *dst,
+                             struct supplemental_page_table *src) {
     struct hash_iterator i;
-    hash_first (&i, &src->page);
+    hash_first(&i, &src->page);
 
-    while (hash_next (&i)) {
-        struct hash_elem *e = hash_cur (&i);
-        struct page *src_page = hash_entry (e, struct page, hash_elem);
+    while (hash_next(&i)) {
+        struct hash_elem *e = hash_cur(&i);
+        struct page *src_page = hash_entry(e, struct page, hash_elem);
         enum vm_type type = src_page->operations->type;
         void *upage = src_page->va;
         bool writable = src_page->writable;
 
-        // UNINIT 페이지 복사 (Lazy Loading 유지)
         if (type == VM_UNINIT) {
-            vm_initializer *init = src_page->uninit.init;
-            void *aux = src_page->uninit.aux;
-
-            if (src_page->uninit.type & VM_FILE) {
-                // [FILE-BACKED UNINIT]
-                struct aux_info *src_aux = (struct aux_info *) aux;
-                struct aux_info *dst_aux = malloc (sizeof (struct aux_info));
-                
-                if (dst_aux == NULL) return false;
-
-                dst_aux->file = file_reopen (src_aux->file);
-                if (dst_aux->file == NULL) {
-                    free (dst_aux);
-                    return false;
-                }
-                dst_aux->ofs = src_aux->ofs;
-                dst_aux->read_bytes = src_aux->read_bytes;
-                dst_aux->zero_bytes = src_aux->zero_bytes;
-
-                if (!vm_alloc_page_with_initializer (src_page->uninit.type, upage, writable, init, dst_aux)) {
-                    file_close (dst_aux->file);
-                    free (dst_aux);
-                    return false;
-                }
-            } else {
-                // [ANON UNINIT] (예: 아직 할당되지 않은 스택 영역)
-                if (!vm_alloc_page_with_initializer (src_page->uninit.type, upage, writable, init, NULL)) {
-                    return false;
-                }
-            }
-        } 
-        // 이미 로드된 페이지 복사 (PRESENT)
-        else {
-            // 자식에게는 VM_ANON으로 할당 (독립적인 페이지)
-            if (!vm_alloc_page_with_initializer (VM_ANON, upage, writable, NULL, NULL)) {
+            if (!copy_uninit_page(dst, src_page, upage, writable))
                 return false;
-            }
-            if (!vm_claim_page (upage)) {
+        } else {
+            if (!copy_present_page(dst, src_page, upage, writable))
                 return false;
-            }
-
-            struct page *dst_page = spt_find_page (dst, upage);
-            
-            // 부모 페이지가 물리 메모리에 없으면 로드 시도
-            if (src_page->frame == NULL) {
-                return false;
-            }
-
-            // 내용 복사 (Deep Copy)
-            if (dst_page->frame != NULL && src_page->frame != NULL) {
-                memcpy (dst_page->frame->kva, src_page->frame->kva, PGSIZE);
-            } else {
-                return false;
-            }
         }
     }
     return true;

@@ -11,6 +11,8 @@
 #include "threads/synch.h"
 #include "filesys/filesys.h"
 #include "userprog/process.h"
+#include "vm/vm.h"
+#include "threads/vaddr.h"
 
 void syscall_entry (void);
 void syscall_handler (struct intr_frame *);
@@ -140,6 +142,24 @@ static void check_address(const void *addr){
 }
 // || pml4_get_page(cur->pml4, addr) == NULL
 
+// 버퍼가 유효하고, 쓰기 권한이 있는지 검사하는 함수
+static void check_writable_buffer(void *buffer, unsigned size){
+	check_address(buffer);
+
+	struct thread *curr = thread_current();
+	void *ptr = buffer;
+
+	for (void *addr = pg_round_down(buffer); addr < buffer +size; addr += PGSIZE){
+		// spt에서 페이지를 읽음
+		struct page *page = spt_find_page(&curr->spt, addr);
+		
+		// 페이지가 존재하는데 쓰기 권한이 없으면 종료
+		if (page != NULL && page->writable == false){
+			handler_exit(-1);
+		}
+	}
+}
+
 static void check_string(const char *str){
 	check_address(str);
 
@@ -147,7 +167,6 @@ static void check_string(const char *str){
 		str++;
 		check_address(str);
 	}
-	
 }
 
 int give_fdt(struct file *file) {
@@ -302,6 +321,8 @@ int handler_read(int fd, void* buffer, unsigned size){
 	if(size == 0) return 0;
 	check_address(buffer);
 	check_address((char*)buffer + size -1);
+	// 쓰기 권한까지 체크
+	check_writable_buffer(buffer, size);
 	char* ptr = (char*) buffer;
 	int bytes_read = 0;
 
