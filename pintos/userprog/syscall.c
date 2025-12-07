@@ -450,6 +450,7 @@ bool handler_remove (const char* file){
 }
 
 int handler_dup2(int oldfd, int newfd) {
+	lock_acquire(&filesys_lock);
     // 입력값 범위 검사
     if (oldfd < 0 || newfd < 0 || oldfd >= 512 || newfd >= 512) 
         return -1;
@@ -484,11 +485,9 @@ int handler_dup2(int oldfd, int newfd) {
             }
         }
         
-        lock_acquire(&filesys_lock);
         if (!other_fd_open){
             file_close(old_file);
         }
-        lock_release(&filesys_lock);
     }
     
     // fd 1(stdout)의 경우 특별 처리
@@ -499,7 +498,8 @@ int handler_dup2(int oldfd, int newfd) {
         // newfd에 oldfd의 파일 객체 포인터 설정 (공유)
         cur->fdt_table[newfd] = file;
     }
-    
+    lock_release(&filesys_lock);
+	
     // 성공했으므로 newfd 반환
     return newfd;
 }

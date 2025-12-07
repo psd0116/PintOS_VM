@@ -191,10 +191,15 @@ do_munmap (void *addr) {
 	while(true){
 		struct page* page = spt_find_page(&thread_current()->spt, addr);
 		if (page == NULL) break; // 매핑된 페이지 없으면 종료
-
-		pml4_clear_page(thread_current()->pml4, page->va);
+		
 		// 페이지 해제 (SPT 제거, 프레임 반납)
 		spt_remove_page(&thread_current()->spt, page->va);
+
+		// 하드훼어 매핑 제거
+		if (pml4_get_page(thread_current()->pml4, addr)) {
+             pml4_clear_page(thread_current()->pml4, addr);
+        }
+
 		addr += PGSIZE;
 	}
 }

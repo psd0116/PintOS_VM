@@ -375,6 +375,12 @@ supplemental_page_table_copy(struct supplemental_page_table *dst,
         struct hash_elem *e = hash_cur(&i);
         struct page *src_page = hash_entry(e, struct page, hash_elem);
         enum vm_type type = src_page->operations->type;
+		
+		// [수정 포인트] VM_FILE 타입(mmap된 페이지)은 자식에게 복사하지 않고 건너뜁니다.
+    	if (type == VM_FILE) {
+        	return true; // 혹은 continue; (구현 방식에 따라 다름)
+    	}
+
         void *upage = src_page->va;
         bool writable = src_page->writable;
 
