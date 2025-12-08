@@ -1,9 +1,11 @@
 /* file.c: Implementation of memory backed file object (mmaped object). */
 
 #include "vm/vm.h"
-#include <string.h>
 #include "threads/vaddr.h"
 #include "threads/mmu.h"
+#include "userprog/syscall.h"
+#include <bitmap.h>
+
 static bool file_backed_swap_in (struct page *page, void *kva);
 static bool file_backed_swap_out (struct page *page);
 static void file_backed_destroy (struct page *page);
@@ -14,14 +16,6 @@ static const struct page_operations file_ops = {
 	.swap_out = file_backed_swap_out,
 	.destroy = file_backed_destroy,
 	.type = VM_FILE,
-};
-
-// 파일 내용
-struct mmap_info {
-    struct file *file;      // 매핑된 파일 포인터
-    off_t offset;           // 파일의 몇 번째 바이트부터 읽을지
-    size_t read_bytes;      // 페이지에서 읽어야 할 실제 데이터 크기
-    size_t zero_bytes;      // 나머지 0으로 채울 크기
 };
 
 /* The initializer of file vm */
@@ -37,22 +31,37 @@ file_backed_initializer (struct page *page, enum vm_type type, void *kva) {
 
 	// mmap 정보를 담을 구조체
 	struct file_page *file_page UNUSED = &page->file;
-	struct mmap_info *aux_info = (struct mmap_info *)page->uninit.aux;
+	struct aux_info *aux_info = (struct aux_info *)page->uninit.aux;
 
 	file_page->file = aux_info->file;
-    file_page->offset = aux_info->offset;
+    file_page->ofs = aux_info->ofs;
     file_page->read_bytes = aux_info->read_bytes;
     file_page->zero_bytes = aux_info->zero_bytes;
 
-    memset (kva, 0, PGSIZE);
-    return true;
+	return true;
 }
 
 /* Swap in the page by read contents from the file. */
 static bool
 file_backed_swap_in (struct page *page, void *kva) {
 	struct file_page *file_page UNUSED = &page->file;
-	memset (kva, 0, PGSIZE);
+	
+	// 파일에서 다시 읽어오면 됨
+    bool lock_held = lock_held_by_current_thread(&filesys_lock);
+    if (!lock_held) lock_acquire(&filesys_lock);
+
+    // 파일 위치 이동 후 읽기
+    // file_read_at을 쓰면 seek 없이 안전하게 읽을 수 있음
+    if (file_read_at(file_page->file, kva, 
+                     file_page->read_bytes, file_page->ofs) != (int)file_page->read_bytes) {
+        if (!lock_held) lock_release(&filesys_lock);
+        return false;
+    }
+
+    // 남은 공간 0으로 초기화
+    memset(kva + file_page->read_bytes, 0, file_page->zero_bytes);
+    
+    if (!lock_held) lock_release(&filesys_lock);
     return true;
 }
 
@@ -60,6 +69,27 @@ file_backed_swap_in (struct page *page, void *kva) {
 static bool
 file_backed_swap_out (struct page *page) {
 	struct file_page *file_page UNUSED = &page->file;
+
+	// Dirty Bit 확인 (수정되었는가?)
+    if (pml4_is_dirty(thread_current()->pml4, page->va)) {
+        
+        bool lock_held = lock_held_by_current_thread(&filesys_lock);
+        if (!lock_held) lock_acquire(&filesys_lock);
+
+        // 수정되었다면 파일에 저장 (Write-back)
+        file_write_at(file_page->file, page->frame->kva, 
+                      file_page->read_bytes, file_page->ofs);
+
+        // Dirty Bit 해제 (저장했으니 이제 깨끗함)
+        pml4_set_dirty(thread_current()->pml4, page->va, false);
+        
+        if (!lock_held) lock_release(&filesys_lock);
+    }
+    
+    // 메모리 해제는 호출자(vm_evict_frame)가 수행
+    // 파일 페이지는 그냥 버리면 됨 (나중에 파일에서 다시 읽으면 되니까)
+    page->frame = NULL;
+
 	return true;
 }
 
@@ -68,35 +98,41 @@ static void
 file_backed_destroy (struct page *page) {
 	struct file_page *file_page UNUSED = &page->file;
 
-	if(page->frame != NULL){
-		// 수정되었는지 확인하기
-		if(pml4_is_dirty(thread_current()->pml4, page->va)){
-			bool lock_held = lock_held_by_current_thread(&filesys_lock);
-            if (!lock_held) lock_acquire(&filesys_lock);
+	// Dirty Bit 확인 후 파일 저장 (Munmap 시 필수)
+    if (pml4_is_dirty(thread_current()->pml4, page->va)) {
+        bool lock_held = lock_held_by_current_thread(&filesys_lock);
+        if (!lock_held) lock_acquire(&filesys_lock);
+        
+        file_write_at(file_page->file, page->frame->kva, 
+                      file_page->read_bytes, file_page->ofs);
+                      
+        if (!lock_held) lock_release(&filesys_lock);
+    }
 
-			// 수정되었다면 파일에 저장
-			file_write_at(page->file.file, page->frame->kva, page->file.read_bytes, page->file.offset);
-			if (!lock_held) lock_release(&filesys_lock);
-			pml4_set_dirty(thread_current()->pml4, page->va, false);
-		}
-	}
-	if (file_page->file != NULL) {
-		bool lock_held = lock_held_by_current_thread(&filesys_lock);
+    // 파일 닫기
+    if (file_page->file != NULL) {
+        bool lock_held = lock_held_by_current_thread(&filesys_lock);
         if (!lock_held) lock_acquire(&filesys_lock);
         file_close(file_page->file);
         if (!lock_held) lock_release(&filesys_lock);
-	}
+    }
 }
 
 static bool lazy_load_file (struct page *page, void *aux) {
-    struct mmap_info *info = (struct mmap_info *)aux;
+    struct aux_info *info = (struct aux_info *)aux;
 
 	page->operations = &file_ops;
 	bool lock_held = lock_held_by_current_thread(&filesys_lock);
     if (!lock_held) lock_acquire(&filesys_lock);
 	
+	if (info->file == NULL) {
+		if (!lock_held) lock_release(&filesys_lock);
+		free(info);
+		return false;
+	}
+
     // 파일 읽기 (Load)
-    file_seek(info->file, info->offset);
+    file_seek(info->file, info->ofs);
     if (file_read(info->file, page->frame->kva, info->read_bytes) != info->read_bytes) {
 		if (!lock_held) lock_release(&filesys_lock); // 실패 시 해제
 		free(info);
@@ -107,12 +143,12 @@ static bool lazy_load_file (struct page *page, void *aux) {
     memset(page->frame->kva + info->read_bytes, 0, info->zero_bytes);
 	if (!lock_held) lock_release(&filesys_lock); // 성공 시 해제
 
-    struct file_page *file_page = &page->file;
+	struct file_page *file_page = &page->file;
     file_page->file = info->file;
-    file_page->offset = info->offset;
+    file_page->ofs = info->ofs;
     file_page->read_bytes = info->read_bytes;
-	file_page->zero_bytes = info->zero_bytes;
-
+    file_page->zero_bytes = info->zero_bytes;
+	file_page->swap_index = -1;  // 초기화
 
     free(info);
     return true;
@@ -122,84 +158,77 @@ static bool lazy_load_file (struct page *page, void *aux) {
 void *
 do_mmap (void *addr, size_t length, int writable, struct file *file, off_t offset) {
 
-	if(addr == NULL) return NULL;
-	if (pg_ofs(addr) != 0) return NULL;
-	if (is_kernel_vaddr(addr)) return NULL;
-	if ((long)length <= 0) return NULL;
+	if (length == 0) return NULL;
 
-	void *check_addr = addr;
-    size_t check_len = length;
-    while (check_len > 0) {
-        if (spt_find_page(&thread_current()->spt, check_addr)) {
-            return NULL; // 이미 올라가 있는 상태
-        }
-        
-        // 스택 영역과 겹치는지도 확인 필요 (spt_find_page가 해결해줄 수도 있지만, stack_bottom 확인 필요할 수 있음)
-        if (check_addr >= (void *)USER_STACK) return NULL; // Pintos 스택 시작점 근처 겹치면 거부 (대략적인 값)
-
-        check_addr += PGSIZE;
-        check_len = (check_len < PGSIZE) ? 0 : check_len - PGSIZE;
-    }
-
-	void *start_addr = addr; // 반환할 시작 주소 저장
-
-	struct file *reopen_file = file_reopen(file); // 여기서 미리 reopen 권장
+    struct file *reopen_file = file_reopen(file);
     if (reopen_file == NULL) return NULL;
-    size_t file_len = file_length(reopen_file);
 
-	while (length > 0) {
-		size_t page_read_bytes = length < PGSIZE ? length : PGSIZE;
-		size_t page_zero_bytes = PGSIZE - page_read_bytes;
-		
-		if (offset + page_read_bytes > file_len) {
-            if (offset >= file_len) {
-                page_read_bytes = 0; // 이미 파일 끝을 지남
-            } else {
-                page_read_bytes = file_len - offset; // 남은 만큼만 읽기
-            }
-            // read_bytes가 줄어든 만큼 zero_bytes를 늘려야 함 (페이지 크기는 유지)
-            page_zero_bytes = PGSIZE - page_read_bytes;
+    void *start_addr = addr; // 반환할 시작 주소 저장
+	bool lock_held = lock_held_by_current_thread(&filesys_lock);
+	if (!lock_held) lock_acquire(&filesys_lock);
+    size_t file_len = file_length(reopen_file);
+	if (!lock_held) lock_release(&filesys_lock);
+
+    // length가 0이 될 때까지 반복
+    while (length > 0) {
+        size_t page_read_bytes = length < PGSIZE ? length : PGSIZE;
+        size_t page_zero_bytes = PGSIZE - page_read_bytes;
+        
+        // 파일 끝을 넘어가는 경우 처리
+		if (offset >= file_len) {
+			page_read_bytes = 0;
+			page_zero_bytes = PGSIZE;
+		} else if (offset + page_read_bytes > file_len) {
+			page_read_bytes = file_len - offset;
+			page_zero_bytes = PGSIZE - page_read_bytes;
+		}
+
+        struct aux_info *info = malloc(sizeof(struct aux_info));
+        if (info == NULL) {
+            file_close(reopen_file);
+            return NULL;
         }
 
-		struct mmap_info *info = malloc(sizeof(struct mmap_info));
-		if (info == NULL) return NULL;
 		info->file = file_reopen(file);
-		info->offset = offset;
+		if (info->file == NULL) {
+			free(info);
+			file_close(reopen_file);
+			return NULL;
+		}
+		
+		info->ofs = offset;
 		info->read_bytes = page_read_bytes;
 		info->zero_bytes = page_zero_bytes;
 
-		// 페이지 예약
-		if (!vm_alloc_page_with_initializer(VM_FILE, addr, writable, lazy_load_file, info)){
-			file_close(info->file);
-			free(info);
-			return NULL;
-		}
+        // 페이지 예약 (VM_FILE 타입)
+        if (!vm_alloc_page_with_initializer(VM_FILE, addr, writable, lazy_load_file, info)){
+            file_close(info->file);
+            free(info);
+            file_close(reopen_file);
+            return NULL;
+        }
 
+        // 다음 페이지로 이동
 		addr += PGSIZE;
-		offset += (length < PGSIZE ? length : PGSIZE); 
-        length -= (length < PGSIZE ? length : PGSIZE);
-	}
-
-	file_close(reopen_file);
-	return start_addr;
+		offset += page_read_bytes;  /* 읽은 바이트만 증가 */
+		length -= page_read_bytes;   /* length도 읽은 바이트만 감소 */
+    }
+    
+    // 원본 reopen_file은 이제 필요 없음 (각 페이지가 복사본 가짐)
+    file_close(reopen_file);
+    return start_addr;
 }
 
 /* Do the munmap */
 void
 do_munmap (void *addr) {
-	// addr 부터 시작해서 연속된 페이지를 찾는다.
-	while(true){
-		struct page* page = spt_find_page(&thread_current()->spt, addr);
-		if (page == NULL) break; // 매핑된 페이지 없으면 종료
-		
-		// 페이지 해제 (SPT 제거, 프레임 반납)
-		spt_remove_page(&thread_current()->spt, page->va);
+	struct thread *cur = thread_current();
+	while (true) {
+        struct page *page = spt_find_page(&cur->spt, addr);
+        if (page == NULL) break;
 
-		// 하드훼어 매핑 제거
-		if (pml4_get_page(thread_current()->pml4, addr)) {
-             pml4_clear_page(thread_current()->pml4, addr);
-        }
+        spt_remove_page(&cur->spt, page);
 
-		addr += PGSIZE;
-	}
+        addr += PGSIZE;
+    }
 }

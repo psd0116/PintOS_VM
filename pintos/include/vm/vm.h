@@ -8,8 +8,8 @@
 struct aux_info {
 	struct file *file;
 	off_t ofs;
-	uint32_t read_bytes;
-	uint32_t zero_bytes;
+	size_t read_bytes;
+	size_t zero_bytes;
 };
 
 enum vm_type {
@@ -57,7 +57,7 @@ struct page {
 	/* Your implementation */
 	bool writable;	// 페이지 쓰기 읽기 권한
 	struct hash_elem hash_elem; // SPT(해시 테이블)에 대한 연결고리
-
+	struct thread *thread;      // 이 페이지를 소유한 스레드
 	/* Per-type data are binded into the union.
 	 * Each function automatically detects the current union */
 	union {

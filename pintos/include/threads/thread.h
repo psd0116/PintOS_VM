@@ -126,8 +126,6 @@ struct thread {
 	struct list child_list;
 	// 부모 자식리스트에 매달린 연결 고리
 	struct list_elem child_elem;
-	// 스택 포인터 백업용
-	uintptr_t stack_pointer;
 #ifdef USERPROG
 	/* Owned by userprog/process.c. */
 	uint64_t *pml4;                     /* Page map level 4 */
@@ -135,6 +133,7 @@ struct thread {
 #ifdef VM
 	/* Table for whole virtual memory owned by thread. */
 	struct supplemental_page_table spt;
+	uintptr_t stack_pointer;
 #endif
 
 	/* Owned by thread.c. */

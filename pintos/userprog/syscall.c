@@ -522,16 +522,16 @@ unsigned handler_tell(int fd){
 }
 
 static void* handler_mmap(void* addr, size_t length, int writable, int fd, off_t offset){
-	// 오프셋이 페이지 단위로 정렬되어 있는지 확인
+	// 오프셋이 페이지 단위로 정렬되지 않으면 실패
 	if (offset % PGSIZE != 0) return NULL;
-	
-	// fd 테이블 검증
-	if (fd < 2|| fd >= 512) return NULL;
+	// 주소 유효성 검사
+	if (addr == NULL || pg_ofs(addr) != 0 || is_kernel_vaddr(addr) || (long)length <= 0) return NULL;
+    // fd가 표준 입출력인 경우 거부
+    if (fd == 0 || fd == 1 || fd >= 512) return NULL;
 
 	// fd를 이용해 파일 객체 찾기
 	struct thread *cur = thread_current();
 	struct file *file = cur->fdt_table[fd];
-
 	if(file == NULL) return NULL;
 
 	if (file == (struct file *)1) return NULL;
@@ -540,7 +540,7 @@ static void* handler_mmap(void* addr, size_t length, int writable, int fd, off_t
 }
 
 static void handler_munmap(void *addr){
-	check_address(addr);
+	if (is_kernel_vaddr(addr)) return;
 	do_munmap(addr);
 }
 
