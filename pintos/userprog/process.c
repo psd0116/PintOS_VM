@@ -253,7 +253,6 @@ __do_fork (void *aux) {
     }
 	lock_release(&filesys_lock);
 	// 성공했으면 엄마한테 신호보내기
-	current->stack_pointer = USER_STACK;
 	sema_up(&current->fork_sema);
 	
 	// 사용자 모드로 전환
@@ -386,26 +385,16 @@ process_exit (void) {
 		curr->running_file = NULL;
 	}
 
+	// 강제종료될 경우 정상적으로 닫히지 않은 잔존 파일들 닫아주기
 	if (curr->fdt_table != NULL) {
         for (int i = 2; i < 512; i++) {
-            struct file *file = curr->fdt_table[i];
-            
-            if (file != NULL) {
-                curr->fdt_table[i] = NULL; // 내 자리 비우기
-
-                // stdout marker가 아니면 파일 닫기
-                if (file != (struct file *)1) {
-                    file_close(file);
-                    
-                    // [핵심] 현재 닫은 파일과 같은 파일을 가리키는 다른 fd들도 미리 NULL 처리
-                    for (int j = i + 1; j < 512; j++) {
-                        if (curr->fdt_table[j] == file) {
-                            curr->fdt_table[j] = NULL; // 미리 지워서 나중에 중복 close 방지
-                        }
-                    }
-                }
+            if (curr->fdt_table[i] != NULL) {
+                // 중복 검사 루프
+                file_close(curr->fdt_table[i]); 
+                curr->fdt_table[i] = NULL;
             }
         }
+        // 테이블 자체 해제
         palloc_free_page(curr->fdt_table);
         curr->fdt_table = NULL;
     }
@@ -900,6 +889,7 @@ lazy_load_segment (struct page *page, void *aux) {
 	if(file_read(new->file, page->frame->kva, new->read_bytes) != (int) new->read_bytes){
         return false; 
     }
+
 	memset(page->frame->kva + new->read_bytes, 0, new->zero_bytes);
 
 	// file_close(new->file);
@@ -950,8 +940,8 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
 			return false;
 		}
 
-		enum vm_type type = writable ? VM_ANON : VM_FILE;
-		if (!vm_alloc_page_with_initializer (type, upage, writable, lazy_load_segment, aux)){
+		// 페이지 예약하기
+		if (!vm_alloc_page_with_initializer (VM_ANON, upage, writable, lazy_load_segment, aux)){
 			free(aux);
 			return false;
 		}

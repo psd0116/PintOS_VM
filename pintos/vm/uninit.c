@@ -68,11 +68,11 @@
 	 struct aux_info *aux = (struct aux_info *)uninit->aux;
 	 /* TODO: Fill this function.
 	  * TODO: If you don't have anything to do, just return. */
-	 // if(aux != NULL){
-	 // 	if(aux->file != NULL){
-	 // 		file_close(aux->file);
-	 // 	}
-	 // 	free(aux);
-	 // }
+	 if(aux != NULL){
+		 if(aux->file != NULL){
+			 file_close(aux->file);
+		 }
+		 free(aux);
+	 }
  }
  

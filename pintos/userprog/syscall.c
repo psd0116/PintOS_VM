@@ -450,7 +450,6 @@ bool handler_remove (const char* file){
 }
 
 int handler_dup2(int oldfd, int newfd) {
-	lock_acquire(&filesys_lock);
     // 입력값 범위 검사
     if (oldfd < 0 || newfd < 0 || oldfd >= 512 || newfd >= 512) 
         return -1;
@@ -485,9 +484,11 @@ int handler_dup2(int oldfd, int newfd) {
             }
         }
         
+        lock_acquire(&filesys_lock);
         if (!other_fd_open){
             file_close(old_file);
         }
+        lock_release(&filesys_lock);
     }
     
     // fd 1(stdout)의 경우 특별 처리
@@ -498,8 +499,7 @@ int handler_dup2(int oldfd, int newfd) {
         // newfd에 oldfd의 파일 객체 포인터 설정 (공유)
         cur->fdt_table[newfd] = file;
     }
-    lock_release(&filesys_lock);
-	
+    
     // 성공했으므로 newfd 반환
     return newfd;
 }
@@ -522,16 +522,16 @@ unsigned handler_tell(int fd){
 }
 
 static void* handler_mmap(void* addr, size_t length, int writable, int fd, off_t offset){
-	// 오프셋이 페이지 단위로 정렬되지 않으면 실패
+	// 오프셋이 페이지 단위로 정렬되어 있는지 확인
 	if (offset % PGSIZE != 0) return NULL;
-	// 주소 유효성 검사
-	if (addr == NULL || pg_ofs(addr) != 0 || is_kernel_vaddr(addr) || (long)length <= 0) return NULL;
-    // fd가 표준 입출력인 경우 거부
-    if (fd == 0 || fd == 1 || fd >= 512) return NULL;
+	
+	// fd 테이블 검증
+	if (fd < 2|| fd >= 512) return NULL;
 
 	// fd를 이용해 파일 객체 찾기
 	struct thread *cur = thread_current();
 	struct file *file = cur->fdt_table[fd];
+
 	if(file == NULL) return NULL;
 
 	if (file == (struct file *)1) return NULL;
@@ -540,7 +540,7 @@ static void* handler_mmap(void* addr, size_t length, int writable, int fd, off_t
 }
 
 static void handler_munmap(void *addr){
-	if (is_kernel_vaddr(addr)) return;
+	check_address(addr);
 	do_munmap(addr);
 }
 

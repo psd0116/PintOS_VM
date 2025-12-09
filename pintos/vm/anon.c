@@ -4,7 +4,6 @@
 #include "devices/disk.h"
 #include "threads/vaddr.h"
 #include <string.h>
-#include <bitmap.h>
 
 /* DO NOT MODIFY BELOW LINE */
 static struct disk *swap_disk;
@@ -20,31 +19,71 @@ static const struct page_operations anon_ops = {
 	.type = VM_ANON,
 };
 
-static struct bitmap *swap_bitmap; 
+static struct list free_swap_list;
 static struct lock swap_lock;
+
+struct swap_slot {
+	struct list_elem elem;
+	size_t slot_index;
+};
 
 /* Initialize the data for anonymous pages */
 void
 vm_anon_init (void) {
 	/* TODO: Set up the swap_disk. */
 	swap_disk = disk_get (1, 1);
+	list_init (&free_swap_list);
+	lock_init (&swap_lock);
+
+	size_t total_slots = disk_size(swap_disk)/ (PGSIZE / DISK_SECTOR_SIZE);
+
+	for (size_t i = 0; i < total_slots; i++){
+		struct swap_slot *slot = malloc(sizeof (struct swap_slot));
+		if (slot == NULL) {
+			PANIC("슬롯 부족");
+		}
+		slot->slot_index = i;
+		list_push_back(&free_swap_list, &slot->elem);
+	}
+}
+
+// 스왑 디스크에서 사용 가능한 slot 할당
+static int alloc_swap_slot (void) {
+	lock_acquire(&swap_lock);
 	
-	// 디스크 크기에 맞춰 비트맵 생성 (페이지 단위)
-    size_t swap_size = disk_size(swap_disk) / (PGSIZE / DISK_SECTOR_SIZE);
-    swap_bitmap = bitmap_create(swap_size);
-    
-    lock_init (&swap_lock);
+	if (list_empty(&free_swap_list)) {
+		lock_release(&swap_lock);
+		return -1;  // 스왑 공간 부족
+	}
+	
+	struct swap_slot *slot = list_entry(list_pop_front(&free_swap_list),struct swap_slot, elem);
+	
+	size_t slot_index = slot->slot_index;
+	free(slot);
+	
+	lock_release(&swap_lock);
+	return slot_index;
+}
+
+// 사용한 slot 프리 리스트에 반환
+static void free_swap_slot (int slot_index) {
+	struct swap_slot *slot = malloc(sizeof(struct swap_slot));
+	slot->slot_index = slot_index;
+	
+	lock_acquire(&swap_lock);
+	list_push_back(&free_swap_list, &slot->elem);
+	lock_release(&swap_lock);
 }
 
 /* Initialize the file mapping */
 bool
 anon_initializer (struct page *page, enum vm_type type, void *kva) {
-	// Set up the handler
+	/* Set up the handler */
 	page->operations = &anon_ops;
-    struct anon_page *anon_page = &page->anon;
-    
-    // 초기 상태는 스왑 디스크에 없음 (-1)
-    anon_page->swap_index = -1;
+	struct anon_page *anon_page UNUSED = &page->anon;
+    /* Stack pages have no initializer, so provide zero-filled memory. */
+	// 초기화 시 스왑 인덱스는 -1
+    anon_page->swap_index = -1; // 아직 스왑 아웃 안함
 
     return true;
 }
@@ -59,24 +98,20 @@ anon_swap_in (struct page *page, void *kva) {
 		return true;
 	}
 
-	// 비트맵 범위 검사
-    if (!bitmap_contains(swap_bitmap, anon_page->swap_index, 1, false)) {
-        // 이미 사용 중이지 않은 인덱스(false)를 접근하려 하면 에러? 
-        // 혹은 범위 체크
-        return false;
-    }
+	int slot_index = anon_page->swap_index;
 
-	disk_sector_t sec_no = anon_page->swap_index * (PGSIZE / DISK_SECTOR_SIZE);	
+	if (slot_index < 0 || slot_index >= disk_size(swap_disk) / (PGSIZE / DISK_SECTOR_SIZE)) {
+		return false;
+	}
 
-	for (int i = 0; i < PGSIZE / DISK_SECTOR_SIZE; i++) {
-        disk_read(swap_disk, sec_no + i, kva + i * DISK_SECTOR_SIZE);
-    }
+	disk_sector_t sector = slot_index * (PGSIZE / DISK_SECTOR_SIZE);
+	
+	for(int i = 0; i < PGSIZE / DISK_SECTOR_SIZE; i++){
+		disk_read(swap_disk, sector + i, (uint8_t *)kva + i * DISK_SECTOR_SIZE);
+	}
 
-	lock_acquire(&swap_lock);
-    bitmap_set(swap_bitmap, anon_page->swap_index, false);
-    lock_release(&swap_lock);
-    
-    anon_page->swap_index = -1;
+	free_swap_slot(slot_index);
+	anon_page->swap_index = -1;
 	
     return true;
 }
@@ -86,29 +121,22 @@ static bool
 anon_swap_out (struct page *page) {
 	struct anon_page *anon_page UNUSED = &page->anon;
 
-	if (page->frame == NULL) return false;
+	if (page->frame == NULL) {
+		return false;
+	}
+	// 사용 가능한 스왑 슬롯 할당
+	int slot_index = alloc_swap_slot();
+	if(slot_index == -1) return false;
 
-	// 빈 슬롯 찾기 (비트맵 스캔)
-    lock_acquire(&swap_lock);
-    // false(빈 공간)인 비트를 찾아서 true(사용 중)로 뒤집음
-    size_t swap_index = bitmap_scan_and_flip(swap_bitmap, 0, 1, false);
-    lock_release(&swap_lock);
+	// 메모리 내용을 디스크에 쓰기
+	uint8_t *kva = page->frame->kva;
+	disk_sector_t sector = slot_index * (PGSIZE / DISK_SECTOR_SIZE);
 
-    if (swap_index == BITMAP_ERROR) {
-        return false; // 스왑 공간 꽉 참
-    }
+	for (int i = 0; i < PGSIZE / DISK_SECTOR_SIZE; i++) {
+		disk_write(swap_disk, sector + i, (uint8_t *)kva + i * DISK_SECTOR_SIZE);
+	}
 
-    // 디스크 쓰기
-    disk_sector_t sec_no = swap_index * (PGSIZE / DISK_SECTOR_SIZE);
-    
-    for (int i = 0; i < PGSIZE / DISK_SECTOR_SIZE; i++) {
-        disk_write(swap_disk, sec_no + i, page->frame->kva + i * DISK_SECTOR_SIZE);
-    }
- 
-    //인덱스 저장
-    anon_page->swap_index = swap_index;
-    
-    // 페이지는 이제 메모리에서 해제될 것이므로 연결 끊기 (호출자가 함)
+	anon_page->swap_index = slot_index;
     return true;
 }
 
@@ -117,11 +145,9 @@ static void
 anon_destroy (struct page *page) {
 	struct anon_page *anon_page UNUSED = &page->anon;
 		
-	// 스왑 슬롯을 점유하고 있다면 해제
-    if (anon_page->swap_index != -1) {
-        lock_acquire(&swap_lock);
-        bitmap_set(swap_bitmap, anon_page->swap_index, false);
-        lock_release(&swap_lock);
-        anon_page->swap_index = -1;
-    }
+	// 스왑 디스크에 있는 경우 슬롯 해제
+	if (anon_page->swap_index != -1) {
+		free_swap_slot(anon_page->swap_index);
+			anon_page->swap_index = -1;  // 중복 해제 방지
+	}
 }
