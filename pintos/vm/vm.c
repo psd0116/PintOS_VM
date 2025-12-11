@@ -239,7 +239,7 @@ static void
 vm_stack_growth (void *addr UNUSED) {
 	void *stack_bottom = pg_round_down (addr);
     // alloc만 수행하기
-	if (vm_alloc_page(VM_ANON| VM_MARKER_0, stack_bottom, true)) {
+	if (!vm_alloc_page(VM_ANON| VM_MARKER_0, stack_bottom, true)) {
 		return;
 	}
 
@@ -337,6 +337,14 @@ vm_do_claim_page (struct page *page) {
 		page->frame = NULL;
 		return false;
 	}
+	
+	/* UNINIT 페이지를 실제 타입(ANON/FILE)으로 초기화 */
+	enum vm_type type = page_get_type(page);
+	if (type == VM_UNINIT) {
+		// UNINIT 페이지는 swap_in을 호출하면 자동으로 초기화됨
+		// 다만 UNINIT 페이지도 swap_in 매크로를 사용하므로 문제없음
+	}
+	
 	/* TODO: Insert page table entry to map page's VA to frame's PA. */
 	// MMU 설정하기 -> 현재 스레드, 가상주소, 커널 가상주소, 쓰기 권한
 	// 매핑 실패시
@@ -353,9 +361,9 @@ vm_do_claim_page (struct page *page) {
 
 // hash_hash_func
 // 2개의 포인터를 넘겨야 함.
-unsigned page_hash (const struct hash_elem *h, void *aux UNUSED){
+uint64_t page_hash (const struct hash_elem *h, void *aux UNUSED){
 	const struct page *p = hash_entry(h, struct page, hash_elem); // hash_elem을 사용해서 struct page를 찾아낸다.
-	return hash_bytes (&p->va, sizeof p->va); // va를 해싱한다.1
+	return hash_bytes (&p->va, sizeof p->va); // va를 해싱한다.
 }
 
 // 버킷 리스트 정렬용 크기 비교 함수

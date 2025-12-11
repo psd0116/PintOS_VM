@@ -2,6 +2,7 @@
 
 #include "vm/vm.h"
 #include <string.h>
+#include <stdio.h>
 #include "devices/disk.h"
 #include "threads/vaddr.h"
 #include "threads/mmu.h"
@@ -123,6 +124,7 @@ file_backed_swap_out (struct page *page) {
     if (pml4_is_dirty(curr->pml4, page->va)) {
         bool lock_held = lock_held_by_current_thread(&filesys_lock);
         if (!lock_held) lock_acquire(&filesys_lock);
+        printf("[vm] file_backed_swap_out: va=%p ofs=%zu write=%zu\n", page->va, (size_t)file_page->ofs, file_page->read_bytes);
         file_write_at(file_page->file, page->frame->kva, file_page->read_bytes, file_page->ofs);
         if (!lock_held) lock_release(&filesys_lock);
         
@@ -142,7 +144,7 @@ file_backed_destroy (struct page *page) {
 	struct file_page *file_page = &page->file;
     struct thread *curr = thread_current();
 
-	// 메모리에 로드되어 있고(frame != NULL), 수정된 적이 있다면(Dirty) 파일에 저장
+    // 메모리에 로드되어 있고(frame != NULL), 수정된 적이 있다면(Dirty) 파일에 저장
     if (page->frame != NULL && pml4_is_dirty(curr->pml4, page->va)) {
         bool lock_held = lock_held_by_current_thread(&filesys_lock);
         if (!lock_held) lock_acquire(&filesys_lock);
@@ -152,21 +154,12 @@ file_backed_destroy (struct page *page) {
         if (!lock_held) lock_release(&filesys_lock);
     }
 
-    // 파일 닫기
-    if (file_page->file != NULL) {
-        bool lock_held = lock_held_by_current_thread(&filesys_lock);
-        if (!lock_held) lock_acquire(&filesys_lock);
-        
-        file_close(file_page->file);
-        
-        if (!lock_held) lock_release(&filesys_lock);
-    }
+    // 파일 닫기는 하지 않음 - munmap에서만 처리
 }
 
 static bool lazy_load_file (struct page *page, void *aux) {
     struct aux_info *info = (struct aux_info *)aux;
 
-	page->operations = &file_ops;
 	bool lock_held = lock_held_by_current_thread(&filesys_lock);
     if (!lock_held) lock_acquire(&filesys_lock);
 	
@@ -177,23 +170,20 @@ static bool lazy_load_file (struct page *page, void *aux) {
 	}
 
     // 파일 읽기 (Load)
+    // 각 페이지가 독립적인 파일 포인터를 가지므로 seek 안전
     file_seek(info->file, info->ofs);
-    if (file_read(info->file, page->frame->kva, info->read_bytes) != info->read_bytes) {
-		if (!lock_held) lock_release(&filesys_lock); // 실패 시 해제
+    
+    int bytes_read = file_read(info->file, page->frame->kva, info->read_bytes);
+    
+    if (bytes_read != (int)info->read_bytes) {
+		if (!lock_held) lock_release(&filesys_lock);
 		free(info);
-		return false; // 읽기 실패
+		return false;
     }
 
     // 0으로 채우기
     memset(page->frame->kva + info->read_bytes, 0, info->zero_bytes);
-	if (!lock_held) lock_release(&filesys_lock); // 성공 시 해제
-
-	struct file_page *file_page = &page->file;
-    file_page->file = info->file;
-    file_page->ofs = info->ofs;
-    file_page->read_bytes = info->read_bytes;
-    file_page->zero_bytes = info->zero_bytes;
-	file_page->swap_index = -1;  // 초기화
+	if (!lock_held) lock_release(&filesys_lock);
 
     free(info);
     return true;
@@ -210,7 +200,7 @@ do_mmap (void *addr, size_t length, int writable, struct file *file, off_t offse
 	
 	if (length == 0) return NULL;
 
-    struct file *reopen_file = file_reopen(file);
+    struct file *reopen_file = file_duplicate(file);
     if (reopen_file == NULL) return NULL;
 
     void *start_addr = addr; // 반환할 시작 주소 저장
@@ -234,32 +224,38 @@ do_mmap (void *addr, size_t length, int writable, struct file *file, off_t offse
 
         struct aux_info *info = malloc(sizeof(struct aux_info));
         if (info == NULL) {
+            lock_held = lock_held_by_current_thread(&filesys_lock);
+            if (!lock_held) lock_acquire(&filesys_lock);
             file_close(reopen_file);
+            if (!lock_held) lock_release(&filesys_lock);
             return NULL;
         }
 
-		info->file = file_reopen(file); 
+		// 모든 페이지가 같은 reopen_file을 공유
+		// lazy_load_file에서 filesys_lock으로 seek/read를 원자적으로 수행
+		info->file = reopen_file;
         info->ofs = offset;
         info->read_bytes = read_bytes_real;
         info->zero_bytes = zero_bytes_real;
 
         // 페이지 예약 (VM_FILE 타입)
         if (!vm_alloc_page_with_initializer(VM_FILE, addr, writable, lazy_load_file, info)){
-            file_close(info->file);
-            free(info);
+            lock_held = lock_held_by_current_thread(&filesys_lock);
+            if (!lock_held) lock_acquire(&filesys_lock);
             file_close(reopen_file);
+            if (!lock_held) lock_release(&filesys_lock);
+            free(info);
             return NULL;
         }
 
         // 다음 페이지로 이동
 		addr += PGSIZE;
 		offset += PGSIZE;
-		if (length >= PGSIZE) length -= PGSIZE;
+		if (length >= PGSIZE) length -= PGSIZE; // 비부호형일때 생각해보기
         else length = 0;
     }
     
-    // 원본 reopen_file은 이제 필요 없음 (각 페이지가 복사본 가짐)
-    file_close(reopen_file);
+    // reopen_file은 do_munmap에서 close됨
     return start_addr;
 }
 
